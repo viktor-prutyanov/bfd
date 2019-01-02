@@ -1,8 +1,6 @@
 /*
  * File backed block device driver.
  *
- * Copyright (C) 2018 Viktor Prutyanov
- *
  * Based on Linux Kernel source.
  *
  */
@@ -25,98 +23,107 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Viktor Prutyanov");
-MODULE_DESCRIPTION("Block device backed by file");
 MODULE_VERSION("0.1");
 
 #define DEVICE_NAME "bfd"
+#define BACKEND_FILE_NAME "/root/bfd_backend0"
 
-#define bfd_alert(...) printk(KERN_ALERT DEVICE_NAME ": " __VA_ARGS__)
-#define bfd_info(...)  printk(KERN_INFO DEVICE_NAME ": " __VA_ARGS__)
-
-#define SECTOR_SHIFT 9
+#define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
+#define PAGE_SECTORS		(1 << PAGE_SECTORS_SHIFT)
 
 struct bfd_device {
     struct gendisk *disk;
     struct request_queue *queue;
     int major;
+    struct file *f;
 };
 
 static struct bfd_device bfd;
+
+static ssize_t bfd_backend_write(const void *buf, size_t count, loff_t offset)
+{
+    return kernel_write(bfd.f, buf, count, &offset);
+}
+
+static ssize_t bfd_backend_read(void *buf, size_t count, loff_t offset)
+{
+    //pr_info("bfd: read count=%lu offset=%lld buf=%p\n", count, offset, buf);
+    return kernel_read(bfd.f, buf, count, &offset);
+}
 
 /*
  * Process a single bvec of a bio.
  */
 static int bfd_do_bvec(struct bfd_device *bfd, struct page *page,
-			unsigned int len, unsigned int off, unsigned int op,
-			sector_t sector)
+        unsigned int len, unsigned int off,
+        unsigned int op, sector_t sector)
 {
-	void *mem;
+    void *mem;
+    unsigned int offset = sector << SECTOR_SHIFT;
 
-    bfd_info("len=%u off=%u sector=%lu page=%p\n", len, off, sector, page);
+    //pr_info("bfd: len=%u off=%u sector=%lu page=%p\n", len, off, sector, page);
 
-	if (op_is_write(op)) {
-        return 0;
-	}
+    mem = kmap_atomic(page);
+    if (!op_is_write(op)) {
+        bfd_backend_read(mem + off, len, offset);
+        flush_dcache_page(page);
+    } else {
+        bfd_backend_write(mem + off, len, offset);
+        flush_dcache_page(page);
+    }
+    kunmap_atomic(mem);
 
-	mem = kmap_atomic(page);
-	if (!op_is_write(op)) {
-        memset(mem + off, 0, len);
-		flush_dcache_page(page);
-	} else {
-		flush_dcache_page(page);
-	}
-	kunmap_atomic(mem);
-
-	return 0;
+    return 0;
 }
 
 static blk_qc_t bfd_make_request(struct request_queue *q, struct bio *bio)
 {
-	struct bio_vec bvec;
-	sector_t sector;
-	struct bvec_iter iter;
+    struct bio_vec bvec;
+    sector_t sector;
+    struct bvec_iter iter;
 
-    bfd_info("make_request\n");
+    //pr_info("bfd: make_request\n");
 
-	sector = bio->bi_iter.bi_sector;
-	if (bio_end_sector(bio) > get_capacity(bio->bi_disk))
-		goto io_error;
+    sector = bio->bi_iter.bi_sector;
+    if (bio_end_sector(bio) > get_capacity(bio->bi_disk)) {
+        goto io_error;
+    }
 
-	bio_for_each_segment(bvec, bio, iter) {
-		unsigned int len = bvec.bv_len;
+    bio_for_each_segment(bvec, bio, iter) {
+        unsigned int len = bvec.bv_len;
 
-		if (bfd_do_bvec(&bfd, bvec.bv_page, len, bvec.bv_offset,
+        if (bfd_do_bvec(&bfd, bvec.bv_page, len, bvec.bv_offset,
                     bio_op(bio), sector)) {
-			goto io_error;
+            goto io_error;
         }
-		sector += len >> SECTOR_SHIFT;
-	}
+        sector += len >> SECTOR_SHIFT;
+    }
 
-	bio_endio(bio);
+    bio_endio(bio);
 
-	return BLK_QC_T_NONE;
+    return BLK_QC_T_NONE;
 
 io_error:
-	bio_io_error(bio);
+    bio_io_error(bio);
 
-	return BLK_QC_T_NONE;
+    return BLK_QC_T_NONE;
 }
 
 static int bfd_rw_page(struct block_device *bdev, sector_t sector,
-        struct page *page, bool op)
+        struct page *page, unsigned int op)
 {
-	int err;
+    int err;
 
-    bfd_info("rw_page\n");
+    //pr_info("bfd: rw_page\n");
 
-	if (PageTransHuge(page)) {
-		return -ENOTSUPP;
+    if (PageTransHuge(page)) {
+        return -ENOTSUPP;
     }
 
-	err = bfd_do_bvec(&bfd, page, PAGE_SIZE, 0, op, sector);
-	page_endio(page, op_is_write(op), err);
+    err = bfd_do_bvec(&bfd, page, PAGE_SIZE, 0, op, sector);
+    page_endio(page, op_is_write(op), err);
 
-	return err;
+    return err;
 }
 
 static const struct block_device_operations bfd_fops = {
@@ -130,7 +137,7 @@ static int bfd_alloc(void)
 
     bfd.queue = blk_alloc_queue(GFP_KERNEL);
     if (!bfd.queue) {
-        bfd_alert("failed to allocate blk queue\n");
+        pr_alert("bfd: failed to allocate blk queue\n");
 
         return -1;
     }
@@ -141,7 +148,7 @@ static int bfd_alloc(void)
     blk_queue_physical_block_size(bfd.queue, PAGE_SIZE);
     bfd.disk = alloc_disk(1);
     if (!bfd.disk) {
-        bfd_alert("failed to allocate disk\n");
+        pr_alert(KERN_ALERT "bfd: failed to allocate disk\n");
         err = -1;
 
         goto out_queue;
@@ -152,14 +159,22 @@ static int bfd_alloc(void)
     bfd.disk->private_data = &bfd;
     bfd.disk->flags = GENHD_FL_EXT_DEVT;
     sprintf(bfd.disk->disk_name, "file0");
-    set_capacity(bfd.disk, 4 << 20); // 4MB
+    set_capacity(bfd.disk, (4 << 20) >> SECTOR_SHIFT);
     bfd.queue->backing_dev_info->capabilities |= BDI_CAP_SYNCHRONOUS_IO;
 
-    queue_flag_set(QUEUE_FLAG_NONROT, bfd.queue);
-    queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, bfd.queue);
+    blk_queue_flag_set(QUEUE_FLAG_NONROT, bfd.queue);
+    blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, bfd.queue);
+
+    bfd.f = filp_open(BACKEND_FILE_NAME, O_RDWR, 0);
+    if (!bfd.f) {
+        pr_info("bfd: failed to open "BACKEND_FILE_NAME"\n");
+        goto out_disk;
+    }
 
     return 0;
 
+out_disk:
+    put_disk(bfd.disk);
 out_queue:
     blk_cleanup_queue(bfd.queue);
 
@@ -168,6 +183,7 @@ out_queue:
 
 static void bfd_free(void)
 {
+    filp_close(bfd.f, NULL);
     put_disk(bfd.disk);
     blk_cleanup_queue(bfd.queue);
 }
@@ -182,7 +198,7 @@ static int __init bfd_init(void)
 
     bfd.major = register_blkdev(0, DEVICE_NAME);
     if (bfd.major <= 0) {
-        bfd_alert("failed to register major number\n");
+        pr_alert("bfd: failed to register major number\n");
         err = -EIO;
 
         goto out_major;
@@ -197,7 +213,7 @@ static int __init bfd_init(void)
     bfd.disk->queue = bfd.queue;
     add_disk(bfd.disk);
 
-    bfd_info("module loaded\n");
+    pr_info("bfd: module loaded\n");
 
     return 0;
 
@@ -215,6 +231,8 @@ static void __exit bfd_exit(void)
     bfd_free();
     unregister_blkdev(bfd.major, DEVICE_NAME);
     bfd.major = 0;
+
+    pr_info("bfd: module unloaded\n");
 }
 
 module_init(bfd_init);
